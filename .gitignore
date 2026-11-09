@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+
+# Local settings / runtime files
+*.ini
+*.log
+*.pdb
+*.d
+*.exe
+
+# One-off screenshots and tool caches
+shot_*.png
+/.fonttools/
+/.cargo/
+
+# OS junk
+.DS_Store
+Thumbs.db

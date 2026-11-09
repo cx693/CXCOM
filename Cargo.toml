@@ -1,0 +1,38 @@
+[package]
+name = "cxcom"
+version = "0.1.0"
+edition = "2021"
+description = "CXCOM serial/network debugger (Rust + egui + OpenGL)"
+build = "build.rs"
+license = "CC-BY-NC-ND-4.0"
+
+[[bin]]
+name = "CXCOM"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "=0.32.3", default-features = false, features = ["glow", "x11", "wayland"] }
+serialport = { version = "=4.9.0", default-features = false }
+memmap2 = "0.9"
+image = { version = "0.25", default-features = false, features = ["png"] }
+regex = "1.13"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52.0", features = [
+    "Win32_Foundation", "Win32_Globalization", "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation", "Win32_System_Threading",
+    "Win32_UI_Controls_Dialogs", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+encoding_rs = "0.8"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+incremental = false
+overflow-checks = false
+debug = false
