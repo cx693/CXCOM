@@ -91,6 +91,7 @@ pub struct App {
     view_dropped: u64,
     view_key: (bool, u8, u32),
     send_text: String,
+    send_just_sent: bool,
     tx_bytes: u64,
     rx_bytes: u64,
     recv_file: Option<File>,
@@ -262,6 +263,7 @@ impl App {
             .unwrap_or_else(|| "OpenGL".into());
         let mut app = Self {
             send_text: String::new(),
+            send_just_sent: false,
             ctx: cc.egui_ctx.clone(),
             fonts: font_catalog,
             show_quick: cfg.show_quick,
@@ -457,6 +459,7 @@ impl App {
             data.extend_from_slice(b"\r\n");
         }
         self.write_data(data);
+        self.send_just_sent = true;
         self.last_timed = Instant::now();
     }
 
@@ -884,6 +887,11 @@ impl App {
                     }
                     ui.label(format!("{} 通道", self.plot_channels.len()));
                     ui.weak("每行可匹配多个 name:value");
+                    ui.add(
+                        egui::Slider::new(&mut self.cfg.plot_hover_size, 12.0..=24.0)
+                            .text("悬停字号")
+                            .fixed_decimals(0),
+                    );
                 });
                 ui.horizontal(|ui| {
                     ui.label("规则:");
@@ -1017,6 +1025,110 @@ impl App {
                 clipped.circle_filled(pts[0], 2.5, ch.color);
             } else if pts.len() > 1 {
                 clipped.add(egui::Shape::line(pts, egui::Stroke::new(1.6_f32, ch.color)));
+            }
+        }
+
+        // Hover readout: vertical guide + nearest sample of each channel.
+        if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
+            if plot.contains(pointer) {
+                let target = xmin
+                    + ((pointer.x - plot.left()) / plot.width().max(1.0)) as f64
+                        * (xmax - xmin);
+                let cx = pointer.x.clamp(plot.left(), plot.right());
+                clipped.line_segment(
+                    [
+                        egui::pos2(cx, plot.top()),
+                        egui::pos2(cx, plot.bottom()),
+                    ],
+                    egui::Stroke::new(1.0_f32, Color32::from_gray(150)),
+                );
+                let mut hovered: Vec<(String, f64, Color32)> = Vec::new();
+                for ch in &self.plot_channels {
+                    if let Some((x, y)) = ch
+                        .points
+                        .iter()
+                        .min_by(|a, b| {
+                            (a.0 - target).abs().total_cmp(&(b.0 - target).abs())
+                        })
+                    {
+                        clipped.circle_filled(map(*x, *y), 3.0, ch.color);
+                        hovered.push((ch.name.clone(), *y, ch.color));
+                    }
+                }
+                if !hovered.is_empty() {
+                    // Configurable 12..24 readout size (default 18).
+                    let tip_size = self.cfg.plot_hover_size.clamp(12.0, 24.0);
+                    let line_h = tip_size + 6.0;
+                    let box_w = (tip_size * 12.0)
+                        .clamp(240.0, (plot.width() - 4.0).max(200.0));
+                    let max_rows = (((plot.height() - line_h - 12.0) / line_h)
+                        .floor() as usize)
+                        .clamp(1, 8);
+                    let shown = hovered.len().min(max_rows);
+                    let more = hovered.len() > shown;
+                    let box_h = 10.0
+                        + line_h
+                        + shown as f32 * line_h
+                        + if more { line_h * 0.8 } else { 0.0 };
+                    let min_bx = plot.left() + 2.0;
+                    let max_bx = (plot.right() - box_w - 2.0).max(min_bx);
+                    let bx = if pointer.x + 12.0 + box_w < plot.right() {
+                        pointer.x + 12.0
+                    } else {
+                        pointer.x - box_w - 12.0
+                    }
+                    .clamp(min_bx, max_bx);
+                    let min_by = plot.top() + 2.0;
+                    let max_by = (plot.bottom() - box_h - 2.0).max(min_by);
+                    let by = (pointer.y + 12.0).clamp(min_by, max_by);
+                    let tip = egui::Rect::from_min_size(
+                        egui::pos2(bx, by),
+                        Vec2::new(box_w, box_h),
+                    );
+                    let tip_bg = if dark {
+                        Color32::from_rgba_unmultiplied(26, 29, 34, 242)
+                    } else {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 246)
+                    };
+                    painter.rect_filled(tip, 5.0, tip_bg);
+                    painter.text(
+                        egui::pos2(bx + 10.0, by + 6.0),
+                        Align2::LEFT_TOP,
+                        format!("{:.2}s", target - xmax),
+                        FontId::monospace(tip_size * 0.8),
+                        text,
+                    );
+                    let rows_y = by + 8.0 + line_h;
+                    for (i, (name, value, color)) in hovered.iter().take(shown).enumerate() {
+                        let y = rows_y + i as f32 * line_h;
+                        let dot = tip_size * 0.45;
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(bx + 10.0, y + (line_h - dot) * 0.5),
+                                Vec2::splat(dot),
+                            ),
+                            1.5,
+                            *color,
+                        );
+                        let name: String = name.chars().take(12).collect();
+                        painter.text(
+                            egui::pos2(bx + 10.0 + dot + 8.0, y + 1.0),
+                            Align2::LEFT_TOP,
+                            format!("{name}: {value:.2}"),
+                            FontId::monospace(tip_size),
+                            text,
+                        );
+                    }
+                    if more {
+                        painter.text(
+                            egui::pos2(bx + 10.0, rows_y + shown as f32 * line_h),
+                            Align2::LEFT_TOP,
+                            format!("... +{} 通道", hovered.len() - shown),
+                            FontId::monospace(tip_size * 0.75),
+                            Color32::from_gray(150),
+                        );
+                    }
+                }
             }
         }
     }
@@ -1197,6 +1309,7 @@ impl App {
                 }
                 if ui.button("清发送区").clicked() {
                     self.send_text.clear();
+                    self.send_just_sent = false;
                 }
                 if ui.button("保存参数").clicked() {
                     self.save_cfg();
@@ -1362,7 +1475,21 @@ impl App {
                 if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl) {
                     self.send_current();
                 }
-                if ui.add_sized([82.0, 56.0], egui::Button::new(RichText::new("发 送").size(16.0))).clicked() {
+                if r.changed() {
+                    self.send_just_sent = false;
+                }
+                let has_data = !self.send_text.trim().is_empty() && !self.send_just_sent;
+                let button = if has_data {
+                    egui::Button::new(
+                        RichText::new("发 送")
+                            .size(16.0)
+                            .color(Color32::WHITE),
+                    )
+                    .fill(Color32::from_rgb(42, 148, 74))
+                } else {
+                    egui::Button::new(RichText::new("发 送").size(16.0))
+                };
+                if ui.add_sized([82.0, 56.0], button).clicked() {
                     self.send_current();
                 }
             });

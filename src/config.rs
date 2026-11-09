@@ -52,6 +52,7 @@ pub struct Config {
     pub font_size: f32,
     pub plot_enabled: bool,
     pub plot_rule: String,
+    pub plot_hover_size: f32,
 
     pub hex_send: bool,
     pub newline: bool,
@@ -100,6 +101,7 @@ impl Default for Config {
             font_size: 12.0,
             plot_enabled: true,
             plot_rule: DEFAULT_PLOT_RULE.into(),
+            plot_hover_size: 18.0,
             hex_send: false,
             newline: false,
             timed: false,
@@ -330,6 +332,7 @@ impl Config {
         cfg.font_size = num(&map, "fontsize", cfg.font_size);
         cfg.plot_enabled = flag(&map, "plotenabled", cfg.plot_enabled);
         cfg.plot_rule = map.get("plotrule").cloned().unwrap_or(cfg.plot_rule);
+        cfg.plot_hover_size = num(&map, "plothoversize", cfg.plot_hover_size).clamp(12.0, 24.0);
         cfg.hex_send = flag(&map, "hexsend", cfg.hex_send);
         cfg.newline = flag(&map, "newline", cfg.newline);
         cfg.timed = flag(&map, "timed", cfg.timed);
@@ -385,6 +388,7 @@ impl Config {
         w("fontsize", format!("{:.1}", self.font_size));
         w("plotenabled", (self.plot_enabled as u8).to_string());
         w("plotrule", self.plot_rule.clone());
+        w("plothoversize", format!("{:.1}", self.plot_hover_size));
         w("hexsend", (self.hex_send as u8).to_string());
         w("newline", (self.newline as u8).to_string());
         w("timed", (self.timed as u8).to_string());
