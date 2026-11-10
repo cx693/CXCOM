@@ -19,8 +19,8 @@ regex = "1.13"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52.0", features = [
-    "Win32_Foundation", "Win32_Globalization", "Win32_System_ProcessStatus",
-    "Win32_System_SystemInformation", "Win32_System_Threading",
+    "Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_System_ProcessStatus",
+    "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading",
     "Win32_UI_Controls_Dialogs", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
 ] }
 
@@ -36,3 +36,17 @@ strip = "symbols"
 incremental = false
 overflow-checks = false
 debug = false
+
+# macOS .app 打包元数据（cargo bundle 使用；Windows/Linux 构建不受影响）
+[package.metadata.bundle]
+name = "CXCOM"
+identifier = "com.cx693.cxcom"
+icon = ["icon/tu.png"]
+version = "0.1.0"
+category = "public.app-category.developer-tools"
+short_description = "串口 / 网络调试器"
+long_description = """
+CXCOM 串口/网络调试器：串口与 TCP/UDP 收发、GB2312/UTF-8 切换、HEX、
+时间戳分包、定时发送、串口绘图与快捷指令。
+"""
+copyright = "CC-BY-NC-ND-4.0"

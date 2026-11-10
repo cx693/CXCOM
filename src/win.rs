@@ -199,9 +199,99 @@ mod imp {
     pub fn local_time() -> Option<(u16, u16, u16, u16)> {
         None
     }
+    /// (private footprint MB, resident MB)
+    #[cfg(target_os = "macos")]
+    pub fn memory_mb() -> (f32, f32) {
+        mac::memory_mb()
+    }
+    #[cfg(not(target_os = "macos"))]
     pub fn memory_mb() -> (f32, f32) {
         (0.0, 0.0)
     }
+
+    /// macOS reads its own memory counters through `proc_pid_rusage`, which is
+    /// part of libSystem, so no extra crate or framework is required.
+    #[cfg(target_os = "macos")]
+    mod mac {
+        use std::ffi::c_void;
+
+        /// `struct rusage_info_v2` from `<sys/resource.h>`. The layout is
+        /// frozen by the ABI, so mirroring it here stays valid across SDKs.
+        #[repr(C)]
+        struct RusageInfoV2 {
+            uuid: [u8; 16],
+            user_time: u64,
+            system_time: u64,
+            pkg_idle_wkups: u64,
+            interrupt_wkups: u64,
+            pageins: u64,
+            wired_size: u64,
+            resident_size: u64,
+            phys_footprint: u64,
+            proc_start_abstime: u64,
+            proc_exit_abstime: u64,
+            child_user_time: u64,
+            child_system_time: u64,
+            child_pkg_idle_wkups: u64,
+            child_interrupt_wkups: u64,
+            child_pageins: u64,
+            child_elapsed_abstime: u64,
+            diskio_bytesread: u64,
+            diskio_byteswritten: u64,
+        }
+
+        const RUSAGE_INFO_V2: i32 = 2;
+
+        extern "C" {
+            fn getpid() -> i32;
+            /// `int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer)`
+            /// with `rusage_info_t` being `void *`.
+            fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut c_void) -> i32;
+        }
+
+        /// `phys_footprint` is what Activity Monitor reports as "Memory"
+        /// (private dirty plus compressed pages), i.e. the macOS counterpart of
+        /// the Windows private working set; the resident size is the closest
+        /// analogue of the reported "committed" figure.
+        pub fn memory_mb() -> (f32, f32) {
+            // SAFETY: all-zero is a valid `rusage_info_v2`; the kernel fully
+            // overwrites it when the call succeeds.
+            let mut info: RusageInfoV2 = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                proc_pid_rusage(getpid(), RUSAGE_INFO_V2, &mut info as *mut _ as *mut c_void)
+            };
+            if rc != 0 {
+                return (0.0, 0.0);
+            }
+            const MB: f64 = 1024.0 * 1024.0;
+            (
+                (info.phys_footprint as f64 / MB) as f32,
+                (info.resident_size as f64 / MB) as f32,
+            )
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn layout_matches_c() {
+                assert_eq!(std::mem::size_of::<RusageInfoV2>(), 160);
+                assert_eq!(std::mem::align_of::<RusageInfoV2>(), 8);
+                assert_eq!(std::mem::offset_of!(RusageInfoV2, resident_size), 64);
+                assert_eq!(std::mem::offset_of!(RusageInfoV2, phys_footprint), 72);
+                assert_eq!(std::mem::offset_of!(RusageInfoV2, diskio_byteswritten), 152);
+            }
+
+            #[test]
+            fn footprint_is_nonzero() {
+                let (private, resident) = memory_mb();
+                assert!(private > 0.0, "phys_footprint was zero");
+                assert!(resident > 0.0, "resident size was zero");
+            }
+        }
+    }
+
     pub fn open_url(url: &str) {
         let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
         let _ = std::process::Command::new(opener).arg(url).spawn();

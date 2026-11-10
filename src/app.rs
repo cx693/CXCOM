@@ -26,6 +26,25 @@ const LIMITS: [(&str, usize); 7] = [
     ("200K", 200_000), ("500K", 500_000), ("1M", 1_000_000), ("2M", 2_000_000),
     ("5M", 5_000_000), ("10M", 10_000_000), ("20M", 20_000_000),
 ];
+/// 行数组的安全上限：显示缓冲按字节封顶，但“全是换行”这类极端
+/// 数据会产生数百万行，行本身也要有独立上限。
+const VIEW_MAX_ROWS: usize = 60_000;
+
+/// 在自动换行的底部栏里给 ComboBox 一个固定宽度的“格子”。
+/// 直接放在 horizontal_wrapped 里时，ComboBox 如果正好落在换行边界，
+/// 会被画到可视区域之外（看起来像凭空消失），套一层 allocate_ui 后
+/// 整块控件会作为一个整体换到下一行。
+fn combo_cell(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, 20.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            // 选中文本超长时截断，保证每个下拉框宽度固定，排版才可预测
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+            add(ui);
+        },
+    );
+}
 
 fn limit_label(limit: usize) -> &'static str {
     for (name, value) in LIMITS {
@@ -80,7 +99,6 @@ pub struct App {
     last_view: Instant,
     follow_tail: bool,
     view_h: f32,
-    display_text: String,
     display_h: f32,
     view_cursor: usize,
     view_decoder: text::Decoder,
@@ -274,7 +292,6 @@ impl App {
             last_view: Instant::now(),
             follow_tail: true,
             view_h: 300.0,
-            display_text: String::new(),
             display_h: 0.0,
             view_cursor: 0,
             view_decoder: text::Decoder::new(EncMode::from_u8(cfg.encoding)),
@@ -381,7 +398,7 @@ impl App {
                     if let Some(f) = self.recv_file.as_mut() {
                         let _ = f.write_all(&d);
                     }
-                    self.rx.add(config::timestamp(), d);
+                    self.rx.add(config::timestamp_ms(), d);
                     self.dirty = true;
                     ctx.request_repaint();
                 }
@@ -429,7 +446,7 @@ impl App {
         }
         self.tx_bytes += n;
         // Echo the transmitted bytes into the same timeline as RX, marked as TX.
-        self.rx.add_tx(config::timestamp(), echo);
+        self.rx.add_tx(config::timestamp_ms(), echo);
         self.dirty = true;
     }
 
@@ -567,10 +584,10 @@ impl App {
             fg: Color32::from_rgb(self.cfg.fg[0], self.cfg.fg[1], self.cfg.fg[2]),
             tx: Color32::from_rgb(0, 80, 200),
             header: Color32::from_rgb(100, 100, 100),
-            cap: 256 * 1024,
+            cap: self.rx.limit(),
+            max_rows: VIEW_MAX_ROWS,
         };
         self.rows = self.rx.render(&opts).0;
-        self.display_text = self.display_from_rows();
         self.display_h = 0.0;
         self.view_cursor = self.rx.chunks().len();
         self.view_decoder = text::Decoder::new(mode);
@@ -625,7 +642,7 @@ impl App {
                         self.rows.push(Row {
                             text: format!(
                                 "[{}] {}",
-                                c.time,
+                                crate::buffer::fmt_time(c.time),
                                 if c.tx { "<--发-->" } else { "-->收<--" }
                             ),
                             color: header,
@@ -686,18 +703,23 @@ impl App {
             self.force = true;
             self.rebuild_all();
         } else {
-            self.display_text = self.display_from_rows();
             self.dirty = false;
             self.last_view = Instant::now();
         }
     }
 
-    fn display_from_rows(&self) -> String {
-        self.rows
-            .iter()
-            .map(|r| r.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
+    /// 按需把所有行拼成一段文本（复制全部 / 保存数据时）。
+    /// 平时只保留逐行数据，避免同时驻留两份大文本。
+    fn display_text_all(&self) -> String {
+        let cap: usize = self.rows.iter().map(|r| r.text.len() + 1).sum();
+        let mut s = String::with_capacity(cap);
+        for (i, r) in self.rows.iter().enumerate() {
+            if i > 0 {
+                s.push('\n');
+            }
+            s.push_str(&r.text);
+        }
+        s
     }
 
     fn toggle_theme(&mut self, ctx: &egui::Context) {
@@ -1234,17 +1256,18 @@ impl App {
                         self.stop_all();
                     }
                 });
-                ui.menu_button("多字符串", |ui| {
-                    if ui.checkbox(&mut self.show_quick, "显示多条字符串面板").changed() {
+                ui.menu_button("工具", |ui| {
+                    if ui.checkbox(&mut self.show_quick, "快捷指令").changed() {
                         self.cfg.show_quick = self.show_quick;
                     }
-                    ui.checkbox(&mut self.loop_on, "循环发送");
-                    ui.separator();
-                    if ui.button("载入 ESP-01S AT 指令").clicked() {
-                        self.cfg.quick = config::at_presets();
-                        self.status("已载入 ESP-01S / ESP8266 AT 指令", false);
+                    if ui.button("绘图").clicked() {
+                        self.show_plot = !self.show_plot;
+                        if !self.show_plot {
+                            self.plot_reset();
+                        }
                         ui.close();
                     }
+                    ui.add_enabled(false, egui::Button::new("开发中..."));
                 });
                 ui.menu_button("帮助", |ui| {
                     if ui.button("加入我们（QQ 群）").clicked() {
@@ -1286,7 +1309,7 @@ impl App {
 
     fn toolbar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("清除窗口").clicked() {
                     self.clear_display();
                     ctx.request_repaint();
@@ -1314,155 +1337,288 @@ impl App {
                 if ui.button("保存参数").clicked() {
                     self.save_cfg();
                 }
-                if ui.button("扩展").clicked() {
-                    self.show_quick = !self.show_quick;
-                    self.cfg.show_quick = self.show_quick;
+            });
+        });
+    }
+
+    /// 端口号下拉框。
+    fn ctl_port(&mut self, ui: &mut egui::Ui) {
+        ui.label("端口号:");
+        ui.add_enabled_ui(self.state == 0 && self.cfg.net_mode == 0, |ui| {
+            combo_cell(ui, 170.0, |ui| {
+                ComboBox::from_id_salt("port").width(170.0)
+                    .selected_text(&self.cfg.port)
+                    .show_ui(ui, |ui| {
+                        let ports = self.ports.clone();
+                        for p in ports {
+                            ui.selectable_value(&mut self.cfg.port, p.clone(), p);
+                        }
+                    });
+            });
+        });
+    }
+
+    /// 打开/关闭连接按钮与 DTR / RTS。
+    fn ctl_conn(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let (label, color) = match self.state {
+            2 => ("关闭连接", Color32::from_rgb(170, 40, 40)),
+            1 => ("取消", Color32::from_rgb(180, 120, 0)),
+            _ => ("打开连接", Color32::from_rgb(0, 120, 60)),
+        };
+        if ui.add(egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(color)).clicked() {
+            self.toggle_conn(ctx);
+        }
+        if self.cfg.net_mode == 0 {
+            if ui.checkbox(&mut self.cfg.dtr, "DTR").changed() {
+                if let Some((tx, _)) = self.conn.as_ref() {
+                    let _ = tx.send(Cmd::Dtr(self.cfg.dtr));
                 }
-                if ui.button("绘图").clicked() {
-                    self.show_plot = !self.show_plot;
-                    if !self.show_plot {
-                        self.plot_reset();
+            }
+            if ui.checkbox(&mut self.cfg.rts, "RTS").changed() {
+                if let Some((tx, _)) = self.conn.as_ref() {
+                    let _ = tx.send(Cmd::Rts(self.cfg.rts));
+                }
+            }
+        }
+    }
+
+    /// 波特率下拉框（仅串口模式）。
+    fn ctl_baud(&mut self, ui: &mut egui::Ui) {
+        if self.cfg.net_mode == 0 {
+            ui.label("波特率:");
+            ui.add_enabled_ui(self.state == 0, |ui| {
+                combo_cell(ui, 90.0, |ui| {
+                    ComboBox::from_id_salt("baud").width(90.0)
+                        .selected_text(self.cfg.baud.to_string())
+                        .show_ui(ui, |ui| {
+                            for b in BAUDS {
+                                ui.selectable_value(&mut self.cfg.baud, b, b.to_string());
+                            }
+                        });
+                });
+            });
+        }
+    }
+
+    /// 编码切换与“更多串口设置”入口。
+    fn ctl_enc(&mut self, ui: &mut egui::Ui) {
+        ui.label("编码:");
+        let mut enc = self.cfg.encoding;
+        combo_cell(ui, 80.0, |ui| {
+            ComboBox::from_id_salt("enc").width(80.0)
+                .selected_text(EncMode::from_u8(enc).name())
+                .show_ui(ui, |ui| {
+                    for (v, n) in [(0u8, "GB2312"), (1, "UTF-8"), (2, "自动")] {
+                        ui.selectable_value(&mut enc, v, n);
+                    }
+                });
+        });
+        if enc != self.cfg.encoding {
+            self.cfg.encoding = enc;
+            self.dirty();
+        }
+        if ui.button("更多串口设置").clicked() {
+            self.show_serial = true;
+        }
+    }
+
+    /// 显示相关：HEX 显示、保存、接收存文件、时间戳。
+    fn ctl_display_opts(&mut self, ui: &mut egui::Ui) {
+        if ui.checkbox(&mut self.cfg.hex_display, "HEX 显示").changed() {
+            self.dirty();
+        }
+        if ui.button("保存数据").clicked() {
+            self.save_data();
+        }
+        let mut want = self.recv_to_file;
+        if ui.checkbox(&mut want, "接收数据到文件").changed() {
+            if want {
+                if let Some(p) = win::save_file_dialog(
+                    "接收数据保存到文件",
+                    &[("二进制文件", "*.bin"), ("所有文件", "*.*")],
+                    "",
+                    "bin",
+                ) {
+                    match OpenOptions::new().create(true).append(true).open(&p) {
+                        Ok(f) => {
+                            self.recv_file = Some(f);
+                            self.recv_to_file = true;
+                        }
+                        Err(e) => self.status(format!("无法打开文件: {e}"), true),
                     }
                 }
-            });
+            } else {
+                self.recv_file = None;
+                self.recv_to_file = false;
+            }
+        }
+        if ui.checkbox(&mut self.cfg.timestamps, "时间戳和分包显示").changed() {
+            self.dirty();
+        }
+    }
+
+    /// 分包超时与显示缓冲上限。
+    fn ctl_limit(&mut self, ui: &mut egui::Ui) {
+        ui.add(egui::DragValue::new(&mut self.cfg.timeout_ms).range(1..=5000).suffix(" ms"));
+        ui.label("缓冲上限:");
+        combo_cell(ui, 70.0, |ui| {
+            ComboBox::from_id_salt("limit").width(70.0)
+                .selected_text(limit_label(self.cfg.rx_limit))
+                .show_ui(ui, |ui| {
+                    for (n, v) in LIMITS {
+                        if ui.selectable_value(&mut self.cfg.rx_limit, v, n).changed() {
+                            self.rx.set_limit(v);
+                            self.dirty();
+                        }
+                    }
+                });
+        });
+    }
+
+    /// 发送选项：HEX、回车换行、定时发送与间隔。
+    fn ctl_send_opts(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.cfg.hex_send, "HEX 发送");
+        ui.checkbox(&mut self.cfg.newline, "加回车换行");
+        if ui.checkbox(&mut self.cfg.timed, "定时发送").changed() {
+            self.last_timed = Instant::now();
+        }
+        ui.add(egui::DragValue::new(&mut self.cfg.interval).range(10..=600000).suffix(" ms/次"));
+    }
+
+    /// 校验范围与校验方式。
+    fn ctl_checksum(&mut self, ui: &mut egui::Ui) {
+        ui.label("第");
+        ui.add(egui::DragValue::new(&mut self.cfg.checksum_start).range(1..=99999));
+        ui.label("字节至");
+        combo_cell(ui, 120.0, |ui| {
+            ComboBox::from_id_salt("tail").width(120.0)
+                .selected_text(["末尾(无帧尾)", "第-1", "第-2", "第-3", "第-4"][self.cfg.checksum_tail.min(4) as usize])
+                .show_ui(ui, |ui| {
+                    for (i, t) in ["末尾(无帧尾)", "第-1", "第-2", "第-3", "第-4"].iter().enumerate() {
+                        ui.selectable_value(&mut self.cfg.checksum_tail, i as u32, *t);
+                    }
+                });
+        });
+        ui.label("加校验");
+        combo_cell(ui, 105.0, |ui| {
+            ComboBox::from_id_salt("sum").width(105.0)
+                .selected_text(ChecksumKind::from_u8(self.cfg.checksum).name())
+                .show_ui(ui, |ui| {
+                    for (v, n) in [(0u8, "None"), (1, "ModbusCRC16"), (2, "ADD"), (3, "XOR")] {
+                        ui.selectable_value(&mut self.cfg.checksum, v, n);
+                    }
+                });
         });
     }
 
     fn controls(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("controls").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("端口号:");
-                ui.add_enabled_ui(self.state == 0 && self.cfg.net_mode == 0, |ui| {
-                    ComboBox::from_id_salt("port").width(150.0)
-                        .selected_text(&self.cfg.port)
-                        .show_ui(ui, |ui| {
-                            let ports = self.ports.clone();
-                            for p in ports {
-                                ui.selectable_value(&mut self.cfg.port, p.clone(), p);
-                            }
-                        });
-                });
-                let (label, color) = match self.state {
-                    2 => ("关闭连接", Color32::from_rgb(170, 40, 40)),
-                    1 => ("取消", Color32::from_rgb(180, 120, 0)),
-                    _ => ("打开连接", Color32::from_rgb(0, 120, 60)),
+            // 先按当前文字量估算每个分组的宽度，再按可用宽度贪心排版：
+            // 放得下就并排，放不下就整组换行。这样既不会把下拉框挤到窗口外，
+            // 也不会在某些宽度下让某一行只剩一个控件、右边留出大片空白。
+            let sp = ui.spacing().item_spacing.x;
+            let pad = ui.spacing().button_padding.x;
+            let icon = ui.spacing().icon_width + ui.spacing().icon_spacing;
+            let tw = |s: &str| {
+                ui.fonts(|f| {
+                    f.layout_no_wrap(s.to_owned(), FontId::proportional(12.0), Color32::WHITE)
+                        .size()
+                        .x
+                })
+            };
+            let btn = |s: &str| tw(s) + 2.0 * pad + 4.0;
+            let chk = |s: &str| icon + tw(s) + 6.0;
+            let mut widths = [0.0f32; 8];
+            widths[0] = tw("端口号:") + 170.0 + sp + 12.0;
+            widths[1] = btn("关闭连接") + chk("DTR") + chk("RTS") + 2.0 * sp + 12.0;
+            widths[2] = if self.cfg.net_mode == 0 {
+                tw("波特率:") + 90.0 + sp + 12.0
+            } else {
+                0.0
+            };
+            widths[3] = tw("编码:") + 80.0 + btn("更多串口设置") + 2.0 * sp + 12.0;
+            widths[4] = chk("HEX 显示")
+                + btn("保存数据")
+                + chk("接收数据到文件")
+                + chk("时间戳和分包显示")
+                + 4.0 * sp
+                + 12.0;
+            widths[5] = 80.0 + tw("缓冲上限:") + 70.0 + 2.0 * sp + 12.0;
+            widths[6] =
+                chk("HEX 发送") + chk("加回车换行") + chk("定时发送") + 90.0 + 4.0 * sp + 12.0;
+            widths[7] = tw("第")
+                + 40.0
+                + tw("字节至")
+                + 120.0
+                + tw("加校验")
+                + 105.0
+                + 6.0 * sp
+                + 12.0;
+
+            // 行数尽量少，并且在同样行数下让最宽的一行尽可能窄（各行更均衡，
+            // 不会出现最后一行只剩一个控件、右边空一大片的情况）。
+            let avail = ui.available_width();
+            let groups: Vec<(usize, f32)> = widths
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, w)| *w > 0.0)
+                .collect();
+            let n = groups.len();
+            let mut best: Option<(usize, f32, Vec<Vec<usize>>)> = None;
+            for mask in 0u32..(1u32 << (n - 1)) {
+                let mut rows: Vec<Vec<usize>> = vec![Vec::new()];
+                for i in 0..n {
+                    if i > 0 && (mask >> (i - 1)) & 1 == 1 {
+                        rows.push(Vec::new());
+                    }
+                    rows.last_mut().unwrap().push(groups[i].0);
+                }
+                let mut max_w: f32 = 0.0;
+                let mut fits = true;
+                for row in &rows {
+                    let w: f32 = row
+                        .iter()
+                        .map(|&gi| widths[gi])
+                        .sum::<f32>()
+                        + sp * (row.len() as f32 - 1.0);
+                    max_w = max_w.max(w);
+                    if w > avail {
+                        fits = false;
+                        break;
+                    }
+                }
+                if !fits {
+                    continue;
+                }
+                let count = rows.len();
+                let better = match &best {
+                    None => true,
+                    Some((bc, bw, _)) => count < *bc || (count == *bc && max_w < *bw),
                 };
-                if ui.add(egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(color)).clicked() {
-                    self.toggle_conn(ctx);
+                if better {
+                    best = Some((count, max_w, rows));
                 }
-                if self.cfg.net_mode == 0 {
-                    if ui.checkbox(&mut self.cfg.dtr, "DTR").changed() {
-                        if let Some((tx, _)) = self.conn.as_ref() {
-                            let _ = tx.send(Cmd::Dtr(self.cfg.dtr));
+            }
+            let rows = best.map(|(_, _, r)| r).unwrap_or_else(|| {
+                vec![groups.iter().map(|&(gi, _)| gi).collect()]
+            });
+            for row in rows {
+                ui.horizontal(|ui| {
+                    for i in row {
+                        match i {
+                            0 => self.ctl_port(ui),
+                            1 => self.ctl_conn(ui, ctx),
+                            2 => self.ctl_baud(ui),
+                            3 => self.ctl_enc(ui),
+                            4 => self.ctl_display_opts(ui),
+                            5 => self.ctl_limit(ui),
+                            6 => self.ctl_send_opts(ui),
+                            _ => self.ctl_checksum(ui),
                         }
                     }
-                    if ui.checkbox(&mut self.cfg.rts, "RTS").changed() {
-                        if let Some((tx, _)) = self.conn.as_ref() {
-                            let _ = tx.send(Cmd::Rts(self.cfg.rts));
-                        }
-                    }
-                    ui.label("波特率:");
-                    ui.add_enabled_ui(self.state == 0, |ui| {
-                        ComboBox::from_id_salt("baud").width(90.0)
-                            .selected_text(self.cfg.baud.to_string())
-                            .show_ui(ui, |ui| {
-                                for b in BAUDS {
-                                    ui.selectable_value(&mut self.cfg.baud, b, b.to_string());
-                                }
-                            });
-                    });
-                }
-                ui.label("编码:");
-                let mut enc = self.cfg.encoding;
-                ComboBox::from_id_salt("enc").width(80.0)
-                    .selected_text(EncMode::from_u8(enc).name())
-                    .show_ui(ui, |ui| {
-                        for (v, n) in [(0u8, "GB2312"), (1, "UTF-8"), (2, "自动")] {
-                            ui.selectable_value(&mut enc, v, n);
-                        }
-                    });
-                if enc != self.cfg.encoding {
-                    self.cfg.encoding = enc;
-                    self.dirty();
-                }
-                if ui.button("更多串口设置").clicked() {
-                    self.show_serial = true;
-                }
-            });
-
-            ui.horizontal_wrapped(|ui| {
-                if ui.checkbox(&mut self.cfg.hex_display, "HEX 显示").changed() {
-                    self.dirty();
-                }
-                if ui.button("保存数据").clicked() {
-                    self.save_data();
-                }
-                let mut want = self.recv_to_file;
-                if ui.checkbox(&mut want, "接收数据到文件").changed() {
-                    if want {
-                        if let Some(p) = win::save_file_dialog(
-                            "接收数据保存到文件",
-                            &[("二进制文件", "*.bin"), ("所有文件", "*.*")],
-                            "",
-                            "bin",
-                        ) {
-                            match OpenOptions::new().create(true).append(true).open(&p) {
-                                Ok(f) => {
-                                    self.recv_file = Some(f);
-                                    self.recv_to_file = true;
-                                }
-                                Err(e) => self.status(format!("无法打开文件: {e}"), true),
-                            }
-                        }
-                    } else {
-                        self.recv_file = None;
-                        self.recv_to_file = false;
-                    }
-                }
-                if ui.checkbox(&mut self.cfg.timestamps, "时间戳和分包显示").changed() {
-                    self.dirty();
-                }
-                ui.add(egui::DragValue::new(&mut self.cfg.timeout_ms).range(1..=5000).suffix(" ms"));
-                ui.label("缓冲上限:");
-                ComboBox::from_id_salt("limit").width(70.0)
-                    .selected_text(limit_label(self.cfg.rx_limit))
-                    .show_ui(ui, |ui| {
-                        for (n, v) in LIMITS {
-                            if ui.selectable_value(&mut self.cfg.rx_limit, v, n).changed() {
-                                self.rx.set_limit(v);
-                                self.dirty();
-                            }
-                        }
-                    });
-            });
-
-            ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut self.cfg.hex_send, "HEX 发送");
-                ui.checkbox(&mut self.cfg.newline, "加回车换行");
-                if ui.checkbox(&mut self.cfg.timed, "定时发送").changed() {
-                    self.last_timed = Instant::now();
-                }
-                ui.add(egui::DragValue::new(&mut self.cfg.interval).range(10..=600000).suffix(" ms/次"));
-                ui.separator();
-                ui.label("第");
-                ui.add(egui::DragValue::new(&mut self.cfg.checksum_start).range(1..=99999));
-                ui.label("字节至");
-                ComboBox::from_id_salt("tail").width(120.0)
-                    .selected_text(["末尾(无帧尾)", "第-1", "第-2", "第-3", "第-4"][self.cfg.checksum_tail.min(4) as usize])
-                    .show_ui(ui, |ui| {
-                        for (i, t) in ["末尾(无帧尾)", "第-1", "第-2", "第-3", "第-4"].iter().enumerate() {
-                            ui.selectable_value(&mut self.cfg.checksum_tail, i as u32, *t);
-                        }
-                    });
-                ui.label("加校验");
-                ComboBox::from_id_salt("sum").width(105.0)
-                    .selected_text(ChecksumKind::from_u8(self.cfg.checksum).name())
-                    .show_ui(ui, |ui| {
-                        for (v, n) in [(0u8, "None"), (1, "ModbusCRC16"), (2, "ADD"), (3, "XOR")] {
-                            ui.selectable_value(&mut self.cfg.checksum, v, n);
-                        }
-                    });
-            });
+                });
+            }
 
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 90.0).max(200.0);
@@ -1493,13 +1649,12 @@ impl App {
                     self.send_current();
                 }
             });
-            ui.horizontal(|ui| {
-                ui.weak(format!("S:{}  R:{}  显示缓冲 {} 字节", self.tx_bytes, self.rx_bytes, self.rx.total()));
-                if let Some(j) = &self.file_job {
+            if let Some(j) = &self.file_job {
+                ui.horizontal(|ui| {
                     let p = j.sent.load(Ordering::Relaxed) as f32 / j.total.max(1) as f32;
                     ui.add(egui::ProgressBar::new(p).desired_width(140.0).text(format!("{}/{}", j.sent.load(Ordering::Relaxed), j.total)));
-                }
-            });
+                });
+            }
         });
     }
 
@@ -1555,7 +1710,6 @@ impl App {
     fn clear_display(&mut self) {
         self.rx.clear();
         self.rows.clear();
-        self.display_text.clear();
         self.view_line.clear();
         self.view_open_row = false;
         self.display_h = 0.0;
@@ -1576,29 +1730,38 @@ impl App {
             .show(ctx, |ui| {
                 self.refresh_view();
                 let size = self.cfg.font_size;
-                let fg = Color32::from_rgb(self.cfg.fg[0], self.cfg.fg[1], self.cfg.fg[2]);
                 let follow = self.follow_tail;
                 let tail_offset = (self.display_h - self.view_h).max(0.0);
                 let mut copy_all = false;
                 let mut clear = false;
                 let mut to_bottom = false;
 
+                // 关键：用 show_rows 按行虚拟化。每帧只对可视范围内的
+                // 几十行做布局/栅格化，而不是把整个显示缓冲当一个
+                // Label 一次性布局——否则 egui 的 galley 布局缓存和
+                // tessellation 中间缓冲会随接收数据量线性增长。
+                let row_h = ui.fonts(|f| f.row_height(&FontId::monospace(size)));
+                let total = self.rows.len();
                 let out = {
-                    let text = self.display_text.as_str();
                     let mut area = ScrollArea::both().auto_shrink([false, false]);
                     if follow {
                         area = area.vertical_scroll_offset(tail_offset);
                     }
-                    area.show_viewport(ui, |ui, _viewport| {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(text)
-                                    .font(FontId::monospace(size))
-                                    .color(fg),
-                            )
-                            .selectable(true)
-                            .wrap_mode(egui::TextWrapMode::Extend),
-                        )
+                    area.show_rows(ui, row_h, total, |ui, range| {
+                        for i in range {
+                            let row = &self.rows[i];
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(row.text.as_str())
+                                        .font(FontId::monospace(size))
+                                        .color(row.color),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Extend)
+                                .selectable(true),
+                            );
+                        }
+                        // 覆盖全部可见行的响应，用于承载右键菜单。
+                        ui.response()
                     })
                 };
 
@@ -1618,8 +1781,9 @@ impl App {
                 });
 
                 if copy_all {
-                    if !self.display_text.is_empty() {
-                        ctx.copy_text(self.display_text.clone());
+                    let text = self.display_text_all();
+                    if !text.is_empty() {
+                        ctx.copy_text(text);
                         self.status("已复制全部显示内容", false);
                     }
                 }
@@ -1653,7 +1817,7 @@ impl App {
 
     fn save_data(&mut self) {
         self.refresh_view();
-        if self.display_text.is_empty() {
+        if self.rows.is_empty() {
             self.status("没有可保存的显示内容", true);
             return;
         }
@@ -1667,7 +1831,7 @@ impl App {
         ) {
             // Save exactly what is on screen: timestamps and HEX formatting
             // included when they are enabled, absent when they are disabled.
-            let mut text = self.display_text.replace('\n', "\r\n");
+            let mut text = self.display_text_all().replace('\n', "\r\n");
             if !text.ends_with("\r\n") {
                 text.push_str("\r\n");
             }
@@ -1780,13 +1944,13 @@ impl App {
             ui.label("2. 编码：GB2312 / UTF-8 / 自动；收和发使用同一编码。");
             ui.label("3. HEX 显示/发送、时间戳分包、校验、定时发送、文件发送。");
             ui.label("   接收窗口同时显示收发：-->收<-- 与 <--发-->，发送内容会回显。");
-            ui.label("4. “扩展”打开多条字符串面板；内置 ESP-01S/ESP8266 AT 预设（AT、WiFi、TCP/UDP、透传、Ping 等）。");
+            ui.label("4. “工具 → 快捷指令”打开快捷指令面板；内置 ESP-01S/ESP8266 AT 预设（AT、WiFi、TCP/UDP、透传、Ping 等）。");
             ui.label("   字符串中的 \\r \\n 会作为回车换行发送；AT 预设默认已带 \\r\\n。");
-            ui.label("5. 接收区可用鼠标拖选任意字符，Ctrl+C 复制选中文字；右键可复制全部。");
+            ui.label("5. 接收区每行可单独用鼠标拖选，Ctrl+C 复制选中文字；右键可复制全部。");
             ui.label("6. Ctrl+Enter 发送。");
             ui.label("7. 串口/TCP 故障会自动关闭并每秒重连，可在串口设置中关闭。");
             ui.label("8. 右上角胶囊按钮切换浅色/深色主题，选择会自动保存。");
-            ui.label("9. 工具栏“绘图”打开串口绘图，按正则提取 name:value；默认规则兼容 Temp: 25.3, Hum: 60。");
+            ui.label("9. “工具 → 绘图”打开串口绘图，按正则提取 name:value；默认规则兼容 Temp: 25.3, Hum: 60。");
             ui.separator();
             ui.label("感兴趣可以加入 QQ 群：947963288");
             if ui.link("点击加入群聊【Rust嵌入式探讨】").clicked() {
@@ -1838,13 +2002,21 @@ impl eframe::App for App {
             self.last_stats = Instant::now();
         }
 
+
+
         self.menus(ctx);
         self.toolbar(ctx);
         egui::TopBottomPanel::bottom("status").exact_height(22.0).show(ctx, |ui| {
+            // 状态栏只有一行：窄窗口时按优先级丢弃次要信息，避免左右两段互相挤压
+            let w = ui.available_width();
             ui.horizontal(|ui| {
                 ui.label(format!("S:{}  R:{}", self.tx_bytes, self.rx_bytes));
-                ui.separator();
-                ui.label(format!("编码: {}", EncMode::from_u8(self.cfg.encoding).name()));
+                ui.label("｜");
+                ui.label(format!("显示缓冲 {} 字节", self.rx.total()));
+                if w >= 460.0 {
+                    ui.separator();
+                    ui.label(format!("编码: {}", EncMode::from_u8(self.cfg.encoding).name()));
+                }
                 ui.separator();
                 let color = if self.error { Color32::from_rgb(190, 30, 30) } else { Color32::from_rgb(0, 90, 20) };
                 ui.add(egui::Label::new(RichText::new(&self.status).color(color)).truncate());
@@ -1856,7 +2028,9 @@ impl eframe::App for App {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(format!("MEM {:.1}MB", self.stats.0));
-                    ui.label(format!("RX {}/{}", self.rx.total(), limit_label(self.rx.limit())));
+                    if w >= 560.0 {
+                        ui.label(format!("RX {}/{}", self.rx.total(), limit_label(self.rx.limit())));
+                    }
                 });
             });
         });

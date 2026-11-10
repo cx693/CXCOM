@@ -122,12 +122,40 @@ impl Default for Config {
 }
 
 pub fn ini_path() -> PathBuf {
+    // macOS .app：不要把配置写进应用包内部（会破坏签名，也不符合规范），
+    // 放到 ~/Library/Application Support/CXCOM/CXCOM.ini，并迁移旧的同级配置。
+    #[cfg(target_os = "macos")]
+    if let (Ok(exe), Some(home)) = (std::env::current_exe(), std::env::var_os("HOME")) {
+        if let Some(path) = macos_bundled_ini(&exe, std::path::Path::new(&home)) {
+            return path;
+        }
+    }
     let mut dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
     dir.push("CXCOM.ini");
     dir
+}
+
+/// 在 .app 里运行时返回 `~/Library/Application Support/CXCOM/CXCOM.ini`：
+/// 应用包内部不应写入用户数据。首次迁移可执行文件同目录的旧配置。
+#[cfg(target_os = "macos")]
+fn macos_bundled_ini(exe: &std::path::Path, home: &std::path::Path) -> Option<PathBuf> {
+    if !exe.to_string_lossy().contains(".app/Contents/MacOS/") {
+        return None;
+    }
+    let dir = home.join("Library").join("Application Support").join("CXCOM");
+    fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("CXCOM.ini");
+    if !path.exists() {
+        if let Some(legacy) = exe.parent().map(|p| p.join("CXCOM.ini")) {
+            if legacy.exists() {
+                let _ = fs::copy(&legacy, &path);
+            }
+        }
+    }
+    Some(path)
 }
 
 pub fn unescape(s: &str) -> String {
@@ -429,9 +457,36 @@ pub fn timestamp() -> String {
     }
 }
 
+/// 午夜以来的毫秒数（0..86_400_000）。接收缓冲用它当紧凑时间戳，
+/// 显示时才通过 `buffer::fmt_time` 格式化。
+pub fn timestamp_ms() -> u32 {
+    match win::local_time() {
+        Some((h, m, s, ms)) => {
+            (h as u32 * 3_600_000 + m as u32 * 60_000 + s as u32 * 1_000 + ms as u32) % 86_400_000
+        }
+        None => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bundle_config_moves_out_of_app() {
+        let root = std::env::temp_dir().join(format!("cxcom_ini_test_{}", std::process::id()));
+        let exe_dir = root.join("CXCOM.app").join("Contents").join("MacOS");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::write(exe_dir.join("CXCOM.ini"), "fontsize=18\n").unwrap();
+        let home = root.join("home");
+        let path = macos_bundled_ini(&exe_dir.join("CXCOM"), &home).expect("bundled ini path");
+        assert!(path.starts_with(home.join("Library").join("Application Support").join("CXCOM")));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fontsize=18\n");
+        // 不在 .app 内运行时保持原行为（exe 同目录）
+        assert!(macos_bundled_ini(&root.join("CXCOM"), &home).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn at_presets_are_available_by_default() {        let cfg = Config::default();

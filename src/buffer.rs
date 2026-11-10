@@ -9,9 +9,20 @@ use crate::text::{Decoder, EncMode};
 
 pub struct Chunk {
     pub t: f64,
-    pub time: String,
+    /// 午夜以来的毫秒数，仅在渲染分组头时才格式化成字符串，
+    /// 避免每个收包都做一次堆分配。
+    pub time: u32,
     pub data: Vec<u8>,
     pub tx: bool,
+}
+
+/// u32 毫秒 -> "HH:MM:SS.mmm"
+pub fn fmt_time(ms: u32) -> String {
+    let h = ms / 3_600_000;
+    let m = (ms / 60_000) % 60;
+    let s = (ms / 1_000) % 60;
+    let milli = ms % 1_000;
+    format!("{h:02}:{m:02}:{s:02}.{milli:03}")
 }
 
 pub struct Row {
@@ -28,6 +39,9 @@ pub struct RenderOpts {
     pub tx: Color32,
     pub header: Color32,
     pub cap: usize,
+    /// 行数上限：显示缓冲按字节封顶，但极端数据（全是换行）会产生
+    /// 数百万行，行数组本身也要有独立的上限。
+    pub max_rows: usize,
 }
 
 pub struct Rx {
@@ -74,15 +88,15 @@ impl Rx {
         self.dropped = 0;
     }
 
-    pub fn add(&mut self, time: String, data: Vec<u8>) {
+    pub fn add(&mut self, time: u32, data: Vec<u8>) {
         self.add_dir(time, data, false);
     }
 
-    pub fn add_tx(&mut self, time: String, data: Vec<u8>) {
+    pub fn add_tx(&mut self, time: u32, data: Vec<u8>) {
         self.add_dir(time, data, true);
     }
 
-    fn add_dir(&mut self, time: String, data: Vec<u8>, tx: bool) {
+    fn add_dir(&mut self, time: u32, data: Vec<u8>, tx: bool) {
         if data.is_empty() {
             return;
         }
@@ -126,6 +140,7 @@ impl Rx {
 
     pub fn render(&self, o: &RenderOpts) -> (Vec<Row>, usize) {
         let cap = o.cap.max(4096);
+        let max_rows = o.max_rows.max(256);
         let tail_bytes = self.total.min(cap);
         let start = self.total - tail_bytes;
         let mut start_offset = self.dropped + start as u64;
@@ -163,7 +178,7 @@ impl Rx {
                     rows.push(Row {
                         text: format!(
                             "[{}] {}",
-                            c.time,
+                            fmt_time(c.time),
                             if c.tx { "<--发-->" } else { "-->收<--" }
                         ),
                         color: o.header,
@@ -211,6 +226,10 @@ impl Rx {
             start_offset += all.len() as u64;
         }
         let _ = start_offset;
+        // 行数上限按尾部保留：旧日志先被丢掉，新数据始终可见。
+        if rows.len() > max_rows {
+            rows.drain(..rows.len() - max_rows);
+        }
         (rows, rendered)
     }
 }
@@ -279,7 +298,7 @@ mod tests {
     #[test]
     fn renders_tx_header() {
         let mut rx = Rx::new(200_000);
-        rx.add_tx("12:00:00.000".into(), b"1234\r\n".to_vec());
+        rx.add_tx(43_200_000, b"1234\r\n".to_vec());
         let opts = RenderOpts {
             hex: false,
             timestamps: true,
@@ -289,6 +308,7 @@ mod tests {
             tx: Color32::BLUE,
             header: Color32::GRAY,
             cap: 256 * 1024,
+            max_rows: 60_000,
         };
         let (rows, _) = rx.render(&opts);
         assert!(rows.iter().any(|r| r.text.contains("<--发-->")));
@@ -298,7 +318,7 @@ mod tests {
     #[test]
     fn renders_utf8_rows() {
         let mut rx = Rx::new(200_000);
-        rx.add("12:00:00.000".into(), "UTF8 中文\r\n".as_bytes().to_vec());
+        rx.add(43_200_000, "UTF8 中文\r\n".as_bytes().to_vec());
         let opts = RenderOpts {
             hex: false,
             timestamps: true,
@@ -308,9 +328,30 @@ mod tests {
             tx: Color32::BLUE,
             header: Color32::GRAY,
             cap: 256 * 1024,
+            max_rows: 60_000,
         };
         let (rows, n) = rx.render(&opts);
         assert!(n > 0);
         assert!(rows.iter().any(|r| r.text.contains("UTF8 中文")));
+    }
+
+    #[test]
+    fn render_caps_row_count() {
+        let mut rx = Rx::new(10_000_000);
+        // 8KB 的换行 = 8192 行，max_rows 截尾后只留最后几行。
+        rx.add(0, vec![b'\n'; 8192]);
+        let opts = RenderOpts {
+            hex: false,
+            timestamps: false,
+            timeout_ms: 20,
+            mode: EncMode::Utf8,
+            fg: Color32::BLACK,
+            tx: Color32::BLUE,
+            header: Color32::GRAY,
+            cap: 10_000_000,
+            max_rows: 100,
+        };
+        let (rows, _) = rx.render(&opts);
+        assert_eq!(rows.len(), 100);
     }
 }

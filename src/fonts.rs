@@ -1,9 +1,10 @@
 //! Enumerate system fonts containing Chinese glyphs and load the chosen one.
 //!
 //! Windows uses C:\Windows\Fonts + the per-user font folder, macOS the system
-//! and user Fonts folders, Linux the fontconfig-style directories. Only the
-//! sfnt/cmap headers are read to test U+4E2D; the selected file is memory-mapped
-//! for egui.
+//! and user Fonts folders plus the Font Book asset directories
+//! (`/System/Library/AssetsV2/com_apple_MobileAsset_Font*`), Linux the
+//! fontconfig-style directories. Only the sfnt/cmap headers are read to test
+//! U+4E2D; the selected file is memory-mapped for egui.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -138,8 +139,390 @@ pub fn supports_chinese(path: &Path, face_index: u32) -> bool {
     false
 }
 
-fn pretty(stem: &str) -> String {
-    let lower = stem.to_ascii_lowercase();
+#[cfg(target_os = "macos")]
+fn utf16be(raw: &[u8]) -> String {
+    let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Number of faces in an sfnt file (a `.ttc` collection can hold several).
+#[cfg(target_os = "macos")]
+fn face_count(path: &Path) -> u32 {
+    let Ok(mut f) = File::open(path) else { return 1 };
+    let Some(head) = read_at(&mut f, 0, 12) else { return 1 };
+    if &head[0..4] == b"ttcf" {
+        u32_at(&head, 8).unwrap_or(1).clamp(1, 64)
+    } else {
+        1
+    }
+}
+
+/// Localised family name of one face, preferring Chinese (zh-CN, zh-TW) and
+/// falling back to English and the Mac name table. This is what the macOS
+/// font menu shows, e.g. "苹方-简", "楷体-简", or "Kaiti SC".
+#[cfg(target_os = "macos")]
+fn family_name(path: &Path, face_index: u32) -> Option<String> {
+    let mut f = File::open(path).ok()?;
+    let head = read_at(&mut f, 0, 12)?;
+    let mut face_off = 0u64;
+    if &head[0..4] == b"ttcf" {
+        if face_index >= u32_at(&head, 8)? {
+            return None;
+        }
+        let off = read_at(&mut f, 12 + 4 * face_index as u64, 4)?;
+        face_off = u32_at(&off, 0)? as u64;
+    } else if face_index > 0 {
+        return None;
+    }
+    let face = read_at(&mut f, face_off, 12)?;
+    let num_tables = u16_at(&face, 4)? as usize;
+    if num_tables == 0 || num_tables > 512 {
+        return None;
+    }
+    let records = read_at(&mut f, face_off + 12, num_tables * 16)?;
+    let mut name_off = None;
+    let mut name_len = 0usize;
+    for i in 0..num_tables {
+        let rec = &records[i * 16..i * 16 + 16];
+        if &rec[0..4] == b"name" {
+            name_off = Some(u32_at(rec, 8)? as u64);
+            name_len = u32_at(rec, 12)? as usize;
+            break;
+        }
+    }
+    let Some(off) = name_off else { return None };
+    if name_len < 6 || name_len > 1024 * 1024 {
+        return None;
+    }
+    let name = read_at(&mut f, off, name_len)?;
+    let count = u16_at(&name, 2)? as usize;
+    let storage = u16_at(&name, 4)? as usize;
+    let mut best: Option<(u8, String)> = None;
+    for i in 0..count.min(2048) {
+        let base = 6 + i * 12;
+        let (Some(pid), Some(eid), Some(lid), Some(nid)) = (
+            u16_at(&name, base),
+            u16_at(&name, base + 2),
+            u16_at(&name, base + 4),
+            u16_at(&name, base + 6),
+        ) else {
+            continue;
+        };
+        if nid != 1 && nid != 16 {
+            continue;
+        }
+        let (Some(len), Some(noff)) = (u16_at(&name, base + 8), u16_at(&name, base + 10)) else {
+            continue;
+        };
+        let start = storage.saturating_add(noff as usize);
+        let end = start.saturating_add(len as usize);
+        if end > name.len() {
+            continue;
+        }
+        let raw = &name[start..end];
+        let (text, lang_score) = match (pid, eid) {
+            (3, 1) => (utf16be(raw), match lid { 0x804 => 0u8, 0x404 => 1, 0x409 => 2, _ => 4 }),
+            (3, 10) => (utf16be(raw), 3),
+            (0, _) => (utf16be(raw), 5),
+            (1, 0) => (String::from_utf8_lossy(raw).into_owned(), 6),
+            _ => continue,
+        };
+        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        let score = lang_score * 2 + if nid == 16 { 0 } else { 1 };
+        if best.as_ref().map_or(true, |(s, _)| score < *s) {
+            best = Some((score, text));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+#[cfg(windows)]
+fn win_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn win_face_count(path: &Path) -> u32 {
+    let Ok(mut f) = File::open(path) else { return 1 };
+    let Some(head) = read_at(&mut f, 0, 12) else { return 1 };
+    if &head[0..4] == b"ttcf" {
+        u32_at(&head, 8).unwrap_or(1).clamp(1, 64)
+    } else {
+        1
+    }
+}
+
+#[cfg(windows)]
+fn win_utf16be(raw: &[u8]) -> String {
+    let units: Vec<u16> = raw
+        .chunks_exact(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Localized family name from the sfnt `name` table (same idea as the macOS
+/// reader, but kept separate so the macOS code path is untouched).
+#[cfg(windows)]
+fn win_family_name(path: &Path, face_index: u32) -> Option<String> {
+    let mut f = File::open(path).ok()?;
+    let head = read_at(&mut f, 0, 12)?;
+    let mut face_off = 0u64;
+    if &head[0..4] == b"ttcf" {
+        if face_index >= u32_at(&head, 8)? {
+            return None;
+        }
+        let off = read_at(&mut f, 12 + 4 * face_index as u64, 4)?;
+        face_off = u32_at(&off, 0)? as u64;
+    } else if face_index > 0 {
+        return None;
+    }
+    let face = read_at(&mut f, face_off, 12)?;
+    let num_tables = u16_at(&face, 4)? as usize;
+    if num_tables == 0 || num_tables > 512 {
+        return None;
+    }
+    let records = read_at(&mut f, face_off + 12, num_tables * 16)?;
+    let mut name_off = None;
+    let mut name_len = 0usize;
+    for i in 0..num_tables {
+        let rec = &records[i * 16..i * 16 + 16];
+        if &rec[0..4] == b"name" {
+            name_off = Some(u32_at(rec, 8)? as u64);
+            name_len = u32_at(rec, 12)? as usize;
+            break;
+        }
+    }
+    let Some(off) = name_off else { return None };
+    if name_len < 6 || name_len > 1024 * 1024 {
+        return None;
+    }
+    let name = read_at(&mut f, off, name_len)?;
+    let count = u16_at(&name, 2)? as usize;
+    let storage = u16_at(&name, 4)? as usize;
+    let mut best: Option<(u8, String)> = None;
+    for i in 0..count.min(2048) {
+        let base = 6 + i * 12;
+        let (Some(pid), Some(eid), Some(lid), Some(nid)) = (
+            u16_at(&name, base),
+            u16_at(&name, base + 2),
+            u16_at(&name, base + 4),
+            u16_at(&name, base + 6),
+        ) else {
+            continue;
+        };
+        if nid != 1 && nid != 16 {
+            continue;
+        }
+        let (Some(len), Some(noff)) = (u16_at(&name, base + 8), u16_at(&name, base + 10)) else {
+            continue;
+        };
+        let start = storage.saturating_add(noff as usize);
+        let end = start.saturating_add(len as usize);
+        if end > name.len() {
+            continue;
+        }
+        let raw = &name[start..end];
+        let (text, lang_score) = match (pid, eid) {
+            (3, 1) => (
+                win_utf16be(raw),
+                match lid {
+                    0x804 => 0u8, // zh-CN
+                    0x404 => 1,   // zh-TW
+                    0x409 => 2,   // en-US
+                    _ => 4,
+                },
+            ),
+            (3, 10) => (win_utf16be(raw), 3),
+            (0, _) => (win_utf16be(raw), 5),
+            (1, 0) => (String::from_utf8_lossy(raw).into_owned(), 6),
+            _ => continue,
+        };
+        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        let score = lang_score * 2 + if nid == 16 { 0 } else { 1 };
+        if best.as_ref().map_or(true, |(s, _)| score < *s) {
+            best = Some((score, text));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+/// Clean a Windows registry font value name, e.g.
+/// "Microsoft YaHei & Microsoft YaHei UI (TrueType)".
+#[cfg(windows)]
+fn registry_aliases(value: &str) -> Vec<String> {
+    let value = value
+        .replace(" (TrueType)", "")
+        .replace(" (OpenType)", "");
+    value
+        .split('&')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.starts_with('@'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Font files registered in HKLM/HKCU along with their display names.
+/// This catches fonts installed into non-default folders, which a plain
+/// directory scan misses.
+#[cfg(windows)]
+fn registered_fonts() -> Vec<(PathBuf, Vec<String>)> {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegEnumValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+        KEY_READ, REG_EXPAND_SZ, REG_SZ,
+    };
+    let sub = win_wide(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts");
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+    let mut found: std::collections::BTreeMap<String, (PathBuf, Vec<String>)> =
+        std::collections::BTreeMap::new();
+
+    unsafe {
+        for root in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
+            let mut key: HKEY = 0;
+            if RegOpenKeyExW(root, sub.as_ptr(), 0, KEY_READ, &mut key) != 0 {
+                continue;
+            }
+            let mut index = 0u32;
+            loop {
+                let mut name = [0u16; 512];
+                let mut name_len = name.len() as u32;
+                let mut data = [0u8; 2048];
+                let mut data_len = data.len() as u32;
+                let mut ty = 0u32;
+                let rc = RegEnumValueW(
+                    key,
+                    index,
+                    name.as_mut_ptr(),
+                    &mut name_len,
+                    std::ptr::null(),
+                    &mut ty,
+                    data.as_mut_ptr(),
+                    &mut data_len,
+                );
+                if rc == 259 {
+                    break;
+                }
+                index += 1;
+                if rc != 0 || (ty != REG_SZ && ty != REG_EXPAND_SZ) {
+                    continue;
+                }
+                let value = String::from_utf16_lossy(&name[..name_len as usize]);
+                let units: Vec<u16> = data[..data_len as usize]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .take_while(|&u| u != 0)
+                    .collect();
+                let file = String::from_utf16_lossy(&units);
+                if file.trim().is_empty() {
+                    continue;
+                }
+                let mut path = PathBuf::from(file.trim());
+                if !path.is_absolute() {
+                    path = PathBuf::from(&windir).join("Fonts").join(path);
+                }
+                let aliases = registry_aliases(&value);
+                let key = path.to_string_lossy().to_ascii_lowercase();
+                found
+                    .entry(key)
+                    .and_modify(|(_, names)| {
+                        for alias in &aliases {
+                            if !names.contains(alias) {
+                                names.push(alias.clone());
+                            }
+                        }
+                    })
+                    .or_insert((path, aliases));
+            }
+            RegCloseKey(key);
+        }
+    }
+    found.into_values().collect()
+}
+
+/// Windows font catalog: registry first, directory scan as a fallback, and
+/// enumerate every face of TTC collections (like the macOS implementation).
+#[cfg(windows)]
+fn scan_windows_fonts(out: &mut Vec<FontFace>) {
+    let mut files: std::collections::BTreeMap<String, (PathBuf, Vec<String>)> =
+        std::collections::BTreeMap::new();
+    for (path, aliases) in registered_fonts() {
+        files.insert(path.to_string_lossy().to_ascii_lowercase(), (path, aliases));
+    }
+    let mut dirs = Vec::new();
+    if let Ok(windir) = std::env::var("WINDIR") {
+        dirs.push(PathBuf::from(windir).join("Fonts"));
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        dirs.push(
+            PathBuf::from(local)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Fonts"),
+        );
+    }
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if ext != "ttf" && ext != "ttc" && ext != "otf" {
+                continue;
+            }
+            let key = path.to_string_lossy().to_ascii_lowercase();
+            files.entry(key).or_insert_with(|| (path, Vec::new()));
+        }
+    }
+
+    for (path, aliases) in files.into_values() {
+        if !path.is_file() {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem.is_empty() || stem.starts_with('@') {
+            continue;
+        }
+        let faces = win_face_count(&path);
+        for index in 0..faces {
+            if !supports_chinese(&path, index) {
+                continue;
+            }
+            let name = win_family_name(&path, index)
+                .or_else(|| aliases.get(index as usize).cloned())
+                .or_else(|| {
+                    aliases.first().map(|first| {
+                        if faces > 1 {
+                            format!("{first} #{}", index + 1)
+                        } else {
+                            first.clone()
+                        }
+                    })
+                })
+                .unwrap_or_else(|| pretty(stem));
+            if name.starts_with('.') {
+                continue;
+            }
+            out.push(FontFace {
+                name,
+                path: path.clone(),
+                index,
+            });
+        }
+    }
+}
+
+fn pretty(stem: &str) -> String {    let lower = stem.to_ascii_lowercase();
     let known = match lower.as_str() {
         "simsun" => Some("宋体"),
         "simhei" => Some("黑体"),
@@ -212,21 +595,41 @@ fn scan_dir(dir: &Path, out: &mut Vec<FontFace>, depth: u8) {
         if stem.is_empty() || stem.starts_with('@') {
             continue;
         }
-        let mut index = 0u32;
-        let mut ok = supports_chinese(&path, 0);
-        if !ok && ext == "ttc" {
-            for i in 1..4 {
-                if supports_chinese(&path, i) {
-                    index = i;
-                    ok = true;
-                    break;
+
+        #[cfg(target_os = "macos")]
+        {
+            // 一个 .ttc 里可以有多个家族（PingFang.ttc 含苹方-简/港/繁，
+            // Songti.ttc 含宋体-简/繁等），所以逐个 face 枚举并取各自的家族名。
+            for index in 0..face_count(&path) {
+                if !supports_chinese(&path, index) {
+                    continue;
                 }
+                let name = family_name(&path, index).unwrap_or_else(|| pretty(stem));
+                // 以 “.” 开头的是系统内部界面字体（.Apple SD Gothic Neo I 等），
+                // 字体册里也不显示，跳过。
+                if name.starts_with('.') {
+                    continue;
+                }
+                out.push(FontFace { name, path: path.clone(), index });
             }
         }
-        if !ok {
-            continue;
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut index = 0u32;
+            let mut ok = supports_chinese(&path, 0);
+            if !ok && ext == "ttc" {
+                for i in 1..4 {
+                    if supports_chinese(&path, i) {
+                        index = i;
+                        ok = true;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                out.push(FontFace { name: pretty(stem), path: path.clone(), index });
+            }
         }
-        out.push(FontFace { name: pretty(stem), path: path.clone(), index });
     }
 }
 
@@ -239,12 +642,7 @@ pub fn catalog() -> Vec<FontFace> {
     let mut fonts = Vec::new();
     #[cfg(windows)]
     {
-        if let Ok(windir) = std::env::var("WINDIR") {
-            scan_dir(&PathBuf::from(windir).join("Fonts"), &mut fonts, 0);
-        }
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            scan_dir(&PathBuf::from(local).join("Microsoft").join("Windows").join("Fonts"), &mut fonts, 0);
-        }
+        scan_windows_fonts(&mut fonts);
     }
     #[cfg(target_os = "macos")]
     {
@@ -252,6 +650,18 @@ pub fn catalog() -> Vec<FontFace> {
         scan_dir(Path::new("/Library/Fonts"), &mut fonts, 0);
         if let Some(home) = home_dir() {
             scan_dir(&home.join("Library").join("Fonts"), &mut fonts, 0);
+        }
+        // “字体册”里很多中文字体是按需下载资源，落在
+        // /System/Library/AssetsV2/com_apple_MobileAsset_Font7/<hash>.asset/AssetData/，
+        // 并不在 Fonts 目录里；不扫这里就只能看到少数几个字体。
+        if let Ok(entries) = std::fs::read_dir("/System/Library/AssetsV2") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name.starts_with("com_apple_MobileAsset_Font") {
+                    scan_dir(&entry.path(), &mut fonts, 0);
+                }
+            }
         }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -270,8 +680,9 @@ pub fn catalog() -> Vec<FontFace> {
             "宋体" => 0,
             "微软雅黑" => 1,
             "黑体" => 2,
-            "PingFang SC" | "Noto Sans CJK" => 1,
-            "Songti SC" | "文泉驿正黑" => 2,
+            "PingFang SC" | "苹方-简" | "Noto Sans CJK" => 1,
+            "Songti SC" | "宋体-简" | "文泉驿正黑" => 2,
+            "Heiti SC" | "黑体-简" => 3,
             _ => 10,
         }
     };
@@ -286,7 +697,7 @@ pub fn default_name(fonts: &[FontFace], wanted: &str) -> String {
     let preferred: &[&str] = if cfg!(windows) {
         &["宋体", "微软雅黑", "黑体"]
     } else if cfg!(target_os = "macos") {
-        &["PingFang SC", "Songti SC", "Heiti SC", "宋体"]
+        &["苹方-简", "PingFang SC", "宋体-简", "Songti SC", "黑体-简", "Heiti SC", "宋体"]
     } else {
         &["Noto Sans CJK", "文泉驿正黑", "思源黑体", "Droid Sans Fallback"]
     };
@@ -305,7 +716,11 @@ pub fn install(ctx: &eframe::egui::Context, fonts: &[FontFace], wanted: &str) ->
     if let Some(f) = fonts.iter().find(|f| f.name == wanted) {
         candidates.push(f);
     }
-    for fallback in ["宋体", "微软雅黑", "黑体", "Noto Sans CJK", "PingFang SC"] {
+    for fallback in [
+        "宋体", "微软雅黑", "黑体", "Noto Sans CJK",
+        // macOS 字体名是中文家族名（见 family_name）
+        "苹方-简", "PingFang SC", "宋体-简", "黑体-简",
+    ] {
         if let Some(f) = fonts.iter().find(|f| f.name == fallback && f.name != wanted) {
             candidates.push(f);
         }
@@ -359,6 +774,11 @@ mod tests {
         let fonts = catalog();
         assert!(fonts.len() >= 1, "expected at least one Chinese font");
         if cfg!(windows) {
+            assert!(
+                fonts.len() >= 5,
+                "expected several registered Chinese fonts, got {}",
+                fonts.len()
+            );
             assert!(fonts.iter().any(|f| f.name == "宋体"), "SimSun should be detected");
         }
         assert!(!default_name(&fonts, "不存在的字体").is_empty());

@@ -23,8 +23,8 @@ fn main() -> eframe::Result<()> {
     let cfg = config::Config::load();
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("CXCOM 串口/网络调试器")
-        .with_inner_size([cfg.win_w.max(820) as f32, cfg.win_h.max(560) as f32])
-        .with_min_inner_size([820.0, 560.0])
+        .with_inner_size([cfg.win_w.max(480) as f32, cfg.win_h.max(560) as f32])
+        .with_min_inner_size([480.0, 560.0])
         .with_position(eframe::egui::pos2(cfg.win_x as f32, cfg.win_y as f32));
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);
