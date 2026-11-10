@@ -74,18 +74,9 @@ fn flush(tok: &mut String, out: &mut Vec<u8>) -> Result<(), String> {
     Ok(())
 }
 
-pub fn apply(data: &[u8], kind: ChecksumKind, start: u32, tail: u32) -> Vec<u8> {
-    if data.is_empty() || kind == ChecksumKind::None {
-        return data.to_vec();
-    }
-    let tail = (tail as usize).min(data.len());
-    let end = data.len() - tail;
-    let first = ((start.max(1) as usize) - 1).min(end);
-    if first >= end {
-        return data.to_vec();
-    }
-    let body = &data[first..end];
-    let sum: Vec<u8> = match kind {
+/// 只计算校验值字节（不追加到数据里）。
+pub fn value(body: &[u8], kind: ChecksumKind) -> Vec<u8> {
+    match kind {
         ChecksumKind::ModbusCrc16 => {
             let mut crc: u16 = 0xFFFF;
             for &b in body {
@@ -99,7 +90,21 @@ pub fn apply(data: &[u8], kind: ChecksumKind, start: u32, tail: u32) -> Vec<u8> 
         ChecksumKind::Add => vec![body.iter().fold(0u8, |a, &b| a.wrapping_add(b))],
         ChecksumKind::Xor => vec![body.iter().fold(0u8, |a, &b| a ^ b)],
         ChecksumKind::None => Vec::new(),
-    };
+    }
+}
+
+pub fn apply(data: &[u8], kind: ChecksumKind, start: u32, tail: u32) -> Vec<u8> {
+    if data.is_empty() || kind == ChecksumKind::None {
+        return data.to_vec();
+    }
+    let tail = (tail as usize).min(data.len());
+    let end = data.len() - tail;
+    let first = ((start.max(1) as usize) - 1).min(end);
+    if first >= end {
+        return data.to_vec();
+    }
+    let body = &data[first..end];
+    let sum = value(body, kind);
     let mut out = Vec::with_capacity(data.len() + sum.len());
     out.extend_from_slice(&data[..end]);
     out.extend_from_slice(&sum);

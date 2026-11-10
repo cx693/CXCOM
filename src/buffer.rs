@@ -140,7 +140,7 @@ impl Rx {
 
     pub fn render(&self, o: &RenderOpts) -> (Vec<Row>, usize) {
         let cap = o.cap.max(4096);
-        let max_rows = o.max_rows.max(256);
+        let max_rows = o.max_rows.max(1);
         let tail_bytes = self.total.min(cap);
         let start = self.total - tail_bytes;
         let mut start_offset = self.dropped + start as u64;
@@ -333,6 +333,38 @@ mod tests {
         let (rows, n) = rx.render(&opts);
         assert!(n > 0);
         assert!(rows.iter().any(|r| r.text.contains("UTF8 中文")));
+    }
+
+    #[test]
+    fn header_uses_current_local_time() {
+        let mut rx = Rx::new(1024);
+        rx.add(crate::config::timestamp_ms(), b"ok\r\n".to_vec());
+        let opts = RenderOpts {
+            hex: false,
+            timestamps: true,
+            timeout_ms: 20,
+            mode: EncMode::Utf8,
+            fg: Color32::BLACK,
+            tx: Color32::BLUE,
+            header: Color32::GRAY,
+            cap: 4096,
+            max_rows: 100,
+        };
+        let (rows, _) = rx.render(&opts);
+        let text = rows[0].text.clone();
+        assert!(text.starts_with('['), "{text}");
+        let stamp = &text[1..13];
+        let shown: i32 = stamp[0..2].parse::<i32>().unwrap() * 3600
+            + stamp[3..5].parse::<i32>().unwrap() * 60
+            + stamp[6..8].parse::<i32>().unwrap();
+
+        // 直接用系统本地时间做对照；非 Windows 平台没有这个接口，跳过。
+        let Some((h, m, s, _ms)) = crate::win::local_time() else {
+            return;
+        };
+        let sys = h as i32 * 3600 + m as i32 * 60 + s as i32;
+        let diff = (shown - sys).abs();
+        assert!(diff.min(86_400 - diff) <= 2, "header={text} sys={sys}");
     }
 
     #[test]

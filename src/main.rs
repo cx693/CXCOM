@@ -6,6 +6,7 @@ mod checksum;
 mod config;
 mod fonts;
 mod text;
+mod tools;
 mod transport;
 mod win;
 

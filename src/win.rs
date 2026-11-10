@@ -196,8 +196,43 @@ mod imp {
     pub fn encode_gbk(s: &str) -> Vec<u8> {
         encoding_rs::GBK.encode(s).0.into_owned()
     }
+    /// 本地时间（时, 分, 秒, 毫秒）。
+    ///
+    /// 非 Windows 平台通过 libc 的 `localtime_r` 获取：macOS 与 Linux 的
+    /// `struct tm` 布局一致（9 个 int + tm_gmtoff + tm_zone），因此共用一份实现。
     pub fn local_time() -> Option<(u16, u16, u16, u16)> {
-        None
+        use std::os::raw::{c_char, c_long};
+
+        #[repr(C)]
+        struct Tm {
+            tm_sec: i32,
+            tm_min: i32,
+            tm_hour: i32,
+            tm_mday: i32,
+            tm_mon: i32,
+            tm_year: i32,
+            tm_wday: i32,
+            tm_yday: i32,
+            tm_isdst: i32,
+            tm_gmtoff: c_long,
+            tm_zone: *const c_char,
+        }
+
+        extern "C" {
+            fn localtime_r(timep: *const c_long, result: *mut Tm) -> *mut Tm;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        let secs = now.as_secs() as c_long;
+        let millis = now.subsec_millis() as u16;
+        let mut tm: Tm = unsafe { std::mem::zeroed() };
+        let ok = unsafe { localtime_r(&secs, &mut tm) };
+        if ok.is_null() {
+            return None;
+        }
+        Some((tm.tm_hour as u16, tm.tm_min as u16, tm.tm_sec as u16, millis))
     }
     /// (private footprint MB, resident MB)
     #[cfg(target_os = "macos")]
@@ -320,3 +355,33 @@ mod imp {
 }
 
 pub use imp::*;
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    /// 非 Windows 平台的本地时间要和系统时钟一致（之前这里返回 None，
+    /// 导致接收区时间戳全部显示成 00:00:00.000）。
+    #[test]
+    fn local_time_matches_system_clock() {
+        let (h, m, s, ms) = local_time().expect("local_time() should be available");
+        assert!(h < 24 && m < 60 && s < 60 && ms < 1000);
+
+        let out = std::process::Command::new("date")
+            .arg("+%H %M %S")
+            .output()
+            .expect("run date");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut it = text.split_whitespace().filter_map(|v| v.parse::<u16>().ok());
+        let (sh, sm, ss) = (
+            it.next().expect("date hour"),
+            it.next().expect("date minute"),
+            it.next().expect("date second"),
+        );
+        let now = h as i32 * 3600 + m as i32 * 60 + s as i32;
+        let sys = sh as i32 * 3600 + sm as i32 * 60 + ss as i32;
+        let diff = (now - sys).abs();
+        let diff = diff.min(86_400 - diff);
+        assert!(diff <= 2, "local_time={now}s system={sys}s");
+    }
+}

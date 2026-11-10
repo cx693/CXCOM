@@ -69,6 +69,36 @@ fn plot_color(i: usize) -> Color32 {
     COLORS[i % COLORS.len()]
 }
 
+/// 滚轮缩放绘图时间窗口：向上滚放大（窗口变小），范围固定 1.5–15 秒。
+fn plot_zoom_span(span: f64, scroll: f32) -> f64 {
+    (span * (-(scroll as f64) * 0.0025).exp()).clamp(1.5, 15.0)
+}
+
+/// 绘图时间窗口 `(起点, 终点)`，跨度被强制限制在 1.5–15 秒。
+fn plot_window(end: f64, span: f64) -> (f64, f64) {
+    let span = span.clamp(1.5, 15.0);
+    (end - span, end)
+}
+
+/// X 轴刻度步长：取 1/2/2.5/5 × 10ⁿ 里最接近 span/4 的值。
+fn plot_tick_step(span: f64) -> f64 {
+    let raw = (span / 4.0).max(1e-6);
+    let mag = 10f64.powf(raw.log10().floor());
+    let n = raw / mag;
+    let step = if n <= 1.0 {
+        1.0
+    } else if n <= 2.0 {
+        2.0
+    } else if n <= 2.5 {
+        2.5
+    } else if n <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    step * mag
+}
+
 struct FileJob {
     total: usize,
     sent: Arc<AtomicUsize>,
@@ -139,6 +169,12 @@ pub struct App {
     plot_error: Option<String>,
     plot_t0: Instant,
     plot_last_prune: Instant,
+    /// 绘图时间窗口（秒）：滚轮缩放，范围 1.5–15 秒，最大不超过 15 秒。
+    plot_span: f64,
+    /// 串口关闭后冻结的时间基准（秒），让曲线停在原地方便分析。
+    plot_hold: Option<f64>,
+    /// 工具菜单里的校验和计算器 / 进制转换器 / ASCII 码表。
+    tools: crate::tools::Tools,
 }
 
 const FONT_CHOICES: [&str; 6] = ["宋体", "黑体", "微软雅黑", "楷体", "仿宋", "Consolas"];
@@ -334,6 +370,9 @@ impl App {
             plot_error: None,
             plot_t0: Instant::now(),
             plot_last_prune: Instant::now(),
+            plot_span: 15.0,
+            plot_hold: None,
+            tools: crate::tools::Tools::new(),
             cfg,
         };
         app.refresh_ports();
@@ -378,6 +417,10 @@ impl App {
         if let Some((tx, _)) = self.conn.take() {
             let _ = tx.send(Cmd::Stop);
         }
+        // 关闭串口后冻结绘图时间轴，保留已有曲线便于分析。
+        if !self.plot_channels.is_empty() {
+            self.plot_hold = Some(self.plot_t0.elapsed().as_secs_f64());
+        }
         self.state = 0;
         self.status("已关闭", false);
     }
@@ -391,8 +434,10 @@ impl App {
                     self.state = 2;
                     self.status(s, false);
                     self.last_timed = Instant::now();
+                    self.plot_hold = None;
                 }
                 Ok(Evt::Data(d)) => {
+                    self.plot_hold = None;
                     self.plot_feed(&d);
                     self.rx_bytes += d.len() as u64;
                     if let Some(f) = self.recv_file.as_mut() {
@@ -410,12 +455,18 @@ impl App {
                 Ok(Evt::Error(e)) => {
                     self.status(e, true);
                     self.state = 0;
+                    if !self.plot_channels.is_empty() {
+                        self.plot_hold = Some(self.plot_t0.elapsed().as_secs_f64());
+                    }
                     keep = false;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     keep = false;
                     self.state = 0;
+                    if !self.plot_channels.is_empty() {
+                        self.plot_hold = Some(self.plot_t0.elapsed().as_secs_f64());
+                    }
                     break;
                 }
             }
@@ -889,6 +940,7 @@ impl App {
         self.plot_channels = Vec::new();
         self.plot_buf = String::new();
         self.plot_last_prune = Instant::now();
+        self.plot_hold = None;
     }
 
     fn plot_window(&mut self, ctx: &egui::Context) {
@@ -902,12 +954,17 @@ impl App {
             .default_size([700.0, 420.0])
             .resizable(true)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut self.cfg.plot_enabled, "启用解析");
                     if ui.button("清空").clicked() {
                         clear = true;
                     }
                     ui.label(format!("{} 通道", self.plot_channels.len()));
+                    ui.label(format!("窗口 {:.1}s", self.plot_span));
+                    if self.plot_hold.is_some() {
+                        ui.weak("已冻结");
+                    }
+                    ui.weak("滚轮缩放 1.5–15s");
                     ui.weak("每行可匹配多个 name:value");
                     ui.add(
                         egui::Slider::new(&mut self.cfg.plot_hover_size, 12.0..=24.0)
@@ -943,7 +1000,7 @@ impl App {
         }
     }
 
-    fn draw_plot(&self, ui: &mut egui::Ui) {
+    fn draw_plot(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             for ch in &self.plot_channels {
                 let (r, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
@@ -976,9 +1033,21 @@ impl App {
             egui::pos2(rect.left() + 52.0, rect.top() + 8.0),
             egui::pos2(rect.right() - 10.0, rect.bottom() - 22.0),
         );
+        // 鼠标在绘图区内时，滚轮缩放时间窗口（1.5–15 秒）。
+        if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
+            if plot.contains(pointer) {
+                let scroll = ui.input(|i| i.raw_scroll_delta.y);
+                if scroll.abs() > 0.01 {
+                    self.plot_span = plot_zoom_span(self.plot_span, scroll);
+                }
+            }
+        }
+
         let now = self.plot_t0.elapsed().as_secs_f64();
-        let xmax = now.max(5.0);
-        let xmin = (xmax - 30.0).max(0.0);
+        // 串口关闭后使用冻结时间，曲线保持在原地不再向左滑走。
+        let end = self.plot_hold.unwrap_or(now);
+        let span = self.plot_span.clamp(1.5, 15.0);
+        let (xmin, xmax) = plot_window(end, span);
         let mut ymin = f64::INFINITY;
         let mut ymax = f64::NEG_INFINITY;
         for ch in &self.plot_channels {
@@ -1019,21 +1088,35 @@ impl App {
                 text,
             );
         }
-        for i in 0..=5 {
-            let t = i as f64 / 5.0;
-            let x = plot.left() + t as f32 * plot.width();
+        // 时间轴分度随窗口宽度自适应：15 s 时 5 s/格，1.5 s 时 0.5 s/格。
+        let tick = plot_tick_step(span);
+        let decimals = if tick >= 1.0 {
+            0
+        } else if tick >= 0.1 {
+            1
+        } else {
+            2
+        };
+        // 刻度从右端 0 s 往左排，保证 “0s / -5s / -10s / -15s” 对齐。
+        let mut k = 0i64;
+        while (k as f64) * tick <= span + 1e-9 {
+            let mut rel = -(k as f64) * tick;
+            if rel.abs() < 1e-9 {
+                rel = 0.0;
+            }
+            let x = plot.right() + (rel / span) as f32 * plot.width();
             painter.line_segment(
                 [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
                 egui::Stroke::new(1.0_f32, grid),
             );
-            let secs = xmin + t * (xmax - xmin);
             painter.text(
                 egui::pos2(x, plot.bottom() + 3.0),
                 Align2::CENTER_TOP,
-                format!("{:.0}s", secs - xmax),
+                format!("{rel:.decimals$}s"),
                 FontId::monospace(9.0),
                 text,
             );
+            k += 1;
         }
         let clipped = painter.with_clip_rect(plot);
         for ch in &self.plot_channels {
@@ -1267,7 +1350,19 @@ impl App {
                         }
                         ui.close();
                     }
-                    ui.add_enabled(false, egui::Button::new("开发中..."));
+                    ui.separator();
+                    if ui.button("校验和计算器").clicked() {
+                        self.tools.show_checksum = true;
+                        ui.close();
+                    }
+                    if ui.button("进制转换器").clicked() {
+                        self.tools.show_base = true;
+                        ui.close();
+                    }
+                    if ui.button("ASCII 码表").clicked() {
+                        self.tools.show_ascii = true;
+                        ui.close();
+                    }
                 });
                 ui.menu_button("帮助", |ui| {
                     if ui.button("加入我们（QQ 群）").clicked() {
@@ -1951,6 +2046,7 @@ impl App {
             ui.label("7. 串口/TCP 故障会自动关闭并每秒重连，可在串口设置中关闭。");
             ui.label("8. 右上角胶囊按钮切换浅色/深色主题，选择会自动保存。");
             ui.label("9. “工具 → 绘图”打开串口绘图，按正则提取 name:value；默认规则兼容 Temp: 25.3, Hum: 60。");
+            ui.label("10. “工具 → 校验和计算器 / 进制转换器 / ASCII 码表”提供独立的调试小工具，不影响收发。");
             ui.separator();
             ui.label("感兴趣可以加入 QQ 群：947963288");
             if ui.link("点击加入群聊【Rust嵌入式探讨】").clicked() {
@@ -1958,6 +2054,8 @@ impl App {
             }
         });
         self.show_help = open;
+
+        self.tools.show(ctx);
     }
 }
 
@@ -2004,6 +2102,7 @@ impl eframe::App for App {
 
 
 
+
         self.menus(ctx);
         self.toolbar(ctx);
         egui::TopBottomPanel::bottom("status").exact_height(22.0).show(ctx, |ui| {
@@ -2043,5 +2142,43 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_cfg();
+    }
+}
+
+#[cfg(test)]
+mod plot_tests {
+    use super::*;
+
+    #[test]
+    fn zoom_span_stays_within_range() {
+        assert_eq!(plot_zoom_span(15.0, 1_000_000.0), 1.5);
+        assert_eq!(plot_zoom_span(1.5, -1_000_000.0), 15.0);
+        assert!((plot_zoom_span(15.0, 0.0) - 15.0).abs() < 1e-9);
+        for scroll in [-500.0, -50.0, -1.0, 0.0, 1.0, 50.0, 500.0] {
+            let v = plot_zoom_span(7.0, scroll);
+            assert!((1.5..=15.0).contains(&v), "span {v}");
+        }
+    }
+
+    #[test]
+    fn tick_step_is_nice() {
+        assert_eq!(plot_tick_step(15.0), 5.0);
+        assert!((plot_tick_step(1.5) - 0.5).abs() < 1e-9);
+        for span in [1.5, 2.0, 5.0, 10.0, 15.0] {
+            let step = plot_tick_step(span);
+            let ticks = span / step;
+            assert!((2.0..=12.0).contains(&ticks), "span {span} step {step}");
+        }
+    }
+
+    #[test]
+    fn window_never_exceeds_15_seconds() {
+        for span in [0.0, 0.5, 1.4, 1.5, 3.0, 14.9, 15.0, 30.0, 100.0] {
+            let (a, b) = plot_window(100.0, span);
+            assert!((b - a) <= 15.0 + 1e-9, "span {span}");
+            assert!((b - a) >= 1.5 - 1e-9, "span {span}");
+        }
+        // 冻结时窗口固定，不随墙钟推进
+        assert_eq!(plot_window(42.0, 15.0), (27.0, 42.0));
     }
 }
